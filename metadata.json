@@ -1,0 +1,6 @@
+{
+  "name": "Invoice Generator Pro",
+  "description": "Pembuat invoice modern dengan pengaturan identitas perusahaan, upload logo kustom, dan cetak langsung ke format PDF.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
