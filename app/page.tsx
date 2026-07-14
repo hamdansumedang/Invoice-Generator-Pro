@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState, useEffect, useRef } from 'react';
-import { Settings, Printer, Plus, Trash2, X, Upload, Download, PenTool } from 'lucide-react';
+import { Settings, Printer, Plus, Trash2, X, Upload, Download, PenTool, Bluetooth } from 'lucide-react';
 import { toPng } from 'html-to-image';
 import { jsPDF } from 'jspdf';
 import SignatureCanvas from 'react-signature-canvas';
@@ -61,32 +61,266 @@ export default function InvoiceApp() {
     address: ''
   });
 
-  const [invoiceDetails, setInvoiceDetails] = useState<InvoiceDetails>({
+  const [invoiceDetails, setInvoiceDetails] = useState<InvoiceDetails>(() => ({
     invoiceNumber: 'INV-' + new Date().toISOString().slice(0, 10).replace(/-/g, ''),
     date: new Date().toISOString().slice(0, 10),
     dueDate: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10),
     taxPercent: 0,
     discount: 0,
     notes: 'Terima kasih atas kepercayaan Anda bertransaksi dengan kami.'
-  });
+  }));
 
   const [items, setItems] = useState<Item[]>([
     { id: '1', description: '', quantity: 1, price: 0 }
   ]);
   const [isExporting, setIsExporting] = useState(false);
-  const [printLayout, setPrintLayout] = useState<'invoice' | 'receipt'>('invoice');
+  const [printLayout, setPrintLayout] = useState<'invoice' | 'receipt' | 'receipt58'>('invoice');
+
+  // Bluetooth Thermal Printer States
+  const [btStatus, setBtStatus] = useState<'disconnected' | 'connecting' | 'connected' | 'unsupported'>('disconnected');
+  const [btDevice, setBtDevice] = useState<any>(null);
+  const [btCharacteristic, setBtCharacteristic] = useState<any>(null);
+  const [btError, setBtError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined' && !('bluetooth' in navigator)) {
+      const timer = setTimeout(() => {
+        setBtStatus('unsupported');
+      }, 0);
+      return () => clearTimeout(timer);
+    }
+  }, []);
+
+  const connectBluetooth = async () => {
+    setBtError(null);
+    setBtStatus('connecting');
+    try {
+      const device = await (navigator as any).bluetooth.requestDevice({
+        acceptAllDevices: true,
+        optionalServices: [
+          "000018f0-0000-1000-8000-00805f9b34fb", // Generic ESC/POS printer service
+          "0000ff00-0000-1000-8000-00805f9b34fb", // Standard Custom service
+          "00001101-0000-1000-8000-00805f9b34fb", // Serial Port Profile SPP
+          "49535343-fe7d-4ae5-8fa9-9fafd205e455", // Microchip SPP
+        ]
+      });
+
+      setBtDevice(device);
+
+      device.addEventListener('gattserverdisconnected', () => {
+        setBtStatus('disconnected');
+        setBtCharacteristic(null);
+        setBtDevice(null);
+      });
+
+      const server = await device.gatt.connect();
+      
+      let char: any = null;
+      const serviceUUIDs = [
+        "000018f0-0000-1000-8000-00805f9b34fb",
+        "0000ff00-0000-1000-8000-00805f9b34fb",
+        "00001101-0000-1000-8000-00805f9b34fb",
+        "49535343-fe7d-4ae5-8fa9-9fafd205e455",
+      ];
+
+      for (const uuid of serviceUUIDs) {
+        try {
+          const service = await server.getPrimaryService(uuid);
+          if (service) {
+            const characteristics = await service.getCharacteristics();
+            char = characteristics.find((c: any) => c.properties.write || c.properties.writeWithoutResponse);
+            if (char) break;
+          }
+        } catch (e) {
+          // Continue searching next service
+        }
+      }
+
+      if (!char) {
+        try {
+          const services = await server.getPrimaryServices();
+          for (const s of services) {
+            const characteristics = await s.getCharacteristics();
+            char = characteristics.find((c: any) => c.properties.write || c.properties.writeWithoutResponse);
+            if (char) break;
+          }
+        } catch (e) {
+          console.error("Failed to discover services/characteristics", e);
+        }
+      }
+
+      if (!char) {
+        throw new Error("Karakteristik penulisan (write) printer tidak ditemukan.");
+      }
+
+      setBtCharacteristic(char);
+      setBtStatus('connected');
+    } catch (error: any) {
+      console.error(error);
+      setBtStatus('disconnected');
+      if (error.name !== 'NotFoundError') {
+        setBtError(error.message || "Gagal menghubungkan Bluetooth Printer.");
+      }
+    }
+  };
+
+  const disconnectBluetooth = () => {
+    if (btDevice && btDevice.gatt.connected) {
+      btDevice.gatt.disconnect();
+    }
+    setBtDevice(null);
+    setBtCharacteristic(null);
+    setBtStatus('disconnected');
+  };
+
+  const sendPrintJob = async () => {
+    if (!btCharacteristic) {
+      alert("Silakan hubungkan printer Bluetooth terlebih dahulu.");
+      return;
+    }
+
+    try {
+      const is58mm = printLayout === 'receipt58';
+      const lineWidth = is58mm ? 32 : 48; // Character width limit: 32 chars for 58mm, 48 chars for 80mm
+
+      const initPrinter = new Uint8Array([0x1B, 0x40]); 
+      const alignCenter = new Uint8Array([0x1B, 0x61, 0x01]); 
+      const alignLeft = new Uint8Array([0x1B, 0x61, 0x00]); 
+      const alignRight = new Uint8Array([0x1B, 0x61, 0x02]); 
+      const fontDouble = new Uint8Array([0x1D, 0x21, 0x11]); 
+      const fontBold = new Uint8Array([0x1B, 0x45, 0x01]); 
+      const fontNormal = new Uint8Array([0x1D, 0x21, 0x00, 0x1B, 0x45, 0x00]); 
+      const feedCut = new Uint8Array([0x0A, 0x0A, 0x0A, 0x0A, 0x1D, 0x56, 0x41, 0x03]); 
+
+      const encoder = new TextEncoder();
+      const textToBytes = (text: string) => encoder.encode(text);
+
+      const buffer: Uint8Array[] = [];
+      
+      buffer.push(initPrinter);
+
+      // 1. Header (Company Name)
+      buffer.push(alignCenter);
+      buffer.push(fontDouble);
+      buffer.push(fontBold);
+      buffer.push(textToBytes((companyInfo.name || "PT ROJO BRONTOLANO") + "\n"));
+      
+      // Address and contacts
+      buffer.push(fontNormal);
+      buffer.push(textToBytes((companyInfo.address || "") + "\n"));
+      if (companyInfo.phone) {
+        buffer.push(textToBytes("Telp: " + companyInfo.phone + "\n"));
+      }
+      if (companyInfo.email) {
+        buffer.push(textToBytes("Email: " + companyInfo.email + "\n"));
+      }
+      
+      const lineChar = "-";
+      buffer.push(textToBytes(lineChar.repeat(lineWidth) + "\n"));
+
+      // 2. Invoice Details
+      buffer.push(alignLeft);
+      buffer.push(textToBytes("No. Inv: " + invoiceDetails.invoiceNumber + "\n"));
+      buffer.push(textToBytes("Tanggal: " + invoiceDetails.date + "\n"));
+      buffer.push(textToBytes("Jatuh Tempo: " + invoiceDetails.dueDate + "\n"));
+      buffer.push(textToBytes("Pelanggan: " + (customerInfo.name || "Umum") + "\n"));
+      
+      buffer.push(textToBytes(lineChar.repeat(lineWidth) + "\n"));
+
+      // 3. Items list
+      items.forEach((item) => {
+        const itemDesc = item.description || "Item";
+        buffer.push(textToBytes(itemDesc + "\n"));
+        
+        const qtyPriceStr = `${item.quantity} x ${formatIDR(item.price)}`;
+        const totalStr = formatIDR(item.quantity * item.price);
+        const spacesCount = lineWidth - qtyPriceStr.length - totalStr.length;
+        const spaces = " ".repeat(Math.max(1, spacesCount));
+        
+        buffer.push(textToBytes(qtyPriceStr + spaces + totalStr + "\n"));
+      });
+
+      buffer.push(textToBytes(lineChar.repeat(lineWidth) + "\n"));
+
+      // 4. Totals (Subtotal, Tax, Discount, Total)
+      const pushRow = (label: string, val: string, isBold = false) => {
+        if (isBold) buffer.push(fontBold);
+        const spacesCount = lineWidth - label.length - val.length;
+        const spaces = " ".repeat(Math.max(1, spacesCount));
+        buffer.push(textToBytes(label + spaces + val + "\n"));
+        if (isBold) buffer.push(fontNormal);
+      };
+
+      pushRow("Subtotal:", formatIDR(subtotal));
+      if (invoiceDetails.taxPercent > 0) {
+        pushRow(`Pajak (${invoiceDetails.taxPercent}%):`, formatIDR(taxAmount));
+      }
+      if (invoiceDetails.discount > 0) {
+        pushRow("Potongan:", "-" + formatIDR(invoiceDetails.discount));
+      }
+      
+      buffer.push(textToBytes(lineChar.repeat(lineWidth) + "\n"));
+      pushRow("TOTAL TAGIHAN:", formatIDR(total), true);
+      buffer.push(textToBytes(lineChar.repeat(lineWidth) + "\n"));
+
+      // 5. Payment details & Notes
+      buffer.push(alignCenter);
+      if (companyInfo.bankDetails) {
+        buffer.push(fontBold);
+        buffer.push(textToBytes("Rekening Pembayaran:\n"));
+        buffer.push(fontNormal);
+        buffer.push(textToBytes(companyInfo.bankDetails + "\n\n"));
+      }
+      
+      if (invoiceDetails.notes) {
+        buffer.push(textToBytes(invoiceDetails.notes + "\n\n"));
+      }
+
+      // 6. Signature Name
+      if (companyInfo.signatureName) {
+        buffer.push(textToBytes("\n" + companyInfo.signatureName + "\n\n\n\n"));
+        buffer.push(textToBytes("(_________________)\n"));
+      }
+
+      buffer.push(feedCut);
+
+      // Flatten and chunk sending
+      const totalLength = buffer.reduce((acc, b) => acc + b.length, 0);
+      const combined = new Uint8Array(totalLength);
+      let offset = 0;
+      for (const b of buffer) {
+        combined.set(b, offset);
+        offset += b.length;
+      }
+
+      const chunkSize = 64; 
+      for (let i = 0; i < combined.length; i += chunkSize) {
+        const chunk = combined.slice(i, i + chunkSize);
+        await btCharacteristic.writeValue(chunk);
+        await new Promise(resolve => setTimeout(resolve, 15));
+      }
+
+      alert("Struk berhasil dicetak melalui Bluetooth!");
+    } catch (error: any) {
+      console.error(error);
+      alert("Gagal mencetak: " + (error.message || error));
+    }
+  };
 
   // Load settings on mount
   useEffect(() => {
-    setMounted(true);
-    const saved = localStorage.getItem('invoice_company_info');
-    if (saved) {
-      try {
-        setCompanyInfo(JSON.parse(saved));
-      } catch (e) {
-        console.error("Failed to parse saved settings", e);
+    const timer = setTimeout(() => {
+      setMounted(true);
+      const saved = localStorage.getItem('invoice_company_info');
+      if (saved) {
+        try {
+          setCompanyInfo(JSON.parse(saved));
+        } catch (e) {
+          console.error("Failed to parse saved settings", e);
+        }
       }
-    }
+    }, 0);
+    return () => clearTimeout(timer);
   }, []);
 
   const saveSettings = (newInfo: CompanyInfo) => {
@@ -100,7 +334,12 @@ export default function InvoiceApp() {
   };
 
   const handleExportPDF = async () => {
-    const previewId = printLayout === 'invoice' ? 'invoice-preview' : 'receipt-preview';
+    let previewId = 'invoice-preview';
+    if (printLayout === 'receipt') {
+      previewId = 'receipt-preview';
+    } else if (printLayout === 'receipt58') {
+      previewId = 'receipt58-preview';
+    }
     const element = document.getElementById(previewId);
     if (!element) return;
     
@@ -112,12 +351,21 @@ export default function InvoiceApp() {
       const imgData = await toPng(element, {
         quality: 1,
         pixelRatio: 2,
+        style: {
+          transform: 'scale(1)',
+          boxShadow: 'none',
+        }
       });
       
+      const isA4 = printLayout === 'invoice';
+      const formatWidth = isA4 ? 210 : (printLayout === 'receipt' ? 80 : 58);
+      // Calculate dynamic height in mm based on element's aspect ratio to prevent clipping or empty space
+      const formatHeight = isA4 ? 297 : (element.offsetHeight * formatWidth) / element.offsetWidth;
+
       const pdf = new jsPDF({
         orientation: 'portrait',
         unit: 'mm',
-        format: 'a4'
+        format: isA4 ? 'a4' : [formatWidth, formatHeight]
       });
       
       const pdfWidth = pdf.internal.pageSize.getWidth();
@@ -126,19 +374,24 @@ export default function InvoiceApp() {
       // Calculate actual image height in pdf units
       const imgHeight = (element.offsetHeight * pdfWidth) / element.offsetWidth;
       
-      let heightLeft = imgHeight;
-      let position = 0;
-      
-      // Add first page
-      pdf.addImage(imgData, 'PNG', 0, position, pdfWidth, imgHeight);
-      heightLeft -= pageHeight;
-      
-      // Add subsequent pages if content overflows
-      while (heightLeft > 0) {
-        position -= pageHeight;
-        pdf.addPage();
+      if (isA4) {
+        let heightLeft = imgHeight;
+        let position = 0;
+        
+        // Add first page
         pdf.addImage(imgData, 'PNG', 0, position, pdfWidth, imgHeight);
         heightLeft -= pageHeight;
+        
+        // Add subsequent pages if content overflows
+        while (heightLeft > 0) {
+          position -= pageHeight;
+          pdf.addPage();
+          pdf.addImage(imgData, 'PNG', 0, position, pdfWidth, imgHeight);
+          heightLeft -= pageHeight;
+        }
+      } else {
+        // Receipt layout uses exactly one customized page size, fitting the continuous stream perfectly
+        pdf.addImage(imgData, 'PNG', 0, 0, pdfWidth, imgHeight);
       }
       
       pdf.save(`${invoiceDetails.invoiceNumber || 'invoice'}.pdf`);
@@ -187,6 +440,35 @@ export default function InvoiceApp() {
 
   return (
     <div className="min-h-screen bg-gray-100 print:bg-white text-gray-900 font-sans">
+      
+      {/* Dynamic style for perfect print settings per layout */}
+      <style dangerouslySetInnerHTML={{ __html: `
+        @media print {
+          @page {
+            size: ${printLayout === 'invoice' ? 'A4' : printLayout === 'receipt' ? '80mm auto' : '58mm auto'} !important;
+            margin: 0 !important;
+          }
+          body, html {
+            background-color: white !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            width: ${printLayout === 'invoice' ? '210mm' : printLayout === 'receipt' ? '80mm' : '58mm'} !important;
+            -webkit-print-color-adjust: exact !important;
+            print-color-adjust: exact !important;
+          }
+          /* Eliminate layout structures from taking extra space or applying margins during browser print */
+          #invoice-preview, #receipt-preview, #receipt58-preview {
+            border: none !important;
+            box-shadow: none !important;
+            border-radius: 0 !important;
+            margin: 0 !important;
+            padding: ${printLayout === 'invoice' ? '20mm' : printLayout === 'receipt' ? '5mm' : '4mm'} !important;
+            width: 100% !important;
+            max-width: 100% !important;
+            min-height: 0 !important;
+          }
+        }
+      ` }} />
       
       {/* Settings Modal */}
       {showSettings && (
@@ -392,15 +674,21 @@ export default function InvoiceApp() {
             <div className="flex bg-white p-1 rounded-xl shadow-sm border items-center">
               <button 
                 onClick={() => setPrintLayout('invoice')}
-                className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${printLayout === 'invoice' ? 'bg-blue-50 text-blue-700' : 'text-gray-500 hover:bg-gray-50'}`}
+                className={`px-3 py-1.5 sm:px-4 sm:py-2 rounded-lg text-xs sm:text-sm font-medium transition-all ${printLayout === 'invoice' ? 'bg-blue-50 text-blue-700' : 'text-gray-500 hover:bg-gray-50'}`}
               >
                 Ukuran A4
               </button>
               <button 
                 onClick={() => setPrintLayout('receipt')}
-                className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${printLayout === 'receipt' ? 'bg-blue-50 text-blue-700' : 'text-gray-500 hover:bg-gray-50'}`}
+                className={`px-3 py-1.5 sm:px-4 sm:py-2 rounded-lg text-xs sm:text-sm font-medium transition-all ${printLayout === 'receipt' ? 'bg-blue-50 text-blue-700' : 'text-gray-500 hover:bg-gray-50'}`}
               >
-                Struk Thermal
+                Struk 80mm
+              </button>
+              <button 
+                onClick={() => setPrintLayout('receipt58')}
+                className={`px-3 py-1.5 sm:px-4 sm:py-2 rounded-lg text-xs sm:text-sm font-medium transition-all ${printLayout === 'receipt58' ? 'bg-blue-50 text-blue-700' : 'text-gray-500 hover:bg-gray-50'}`}
+              >
+                Struk 58mm
               </button>
             </div>
             
@@ -428,12 +716,72 @@ export default function InvoiceApp() {
             </div>
           </div>
 
+          {/* Bluetooth Connection panel */}
+          {(printLayout === 'receipt' || printLayout === 'receipt58') && (
+            <div className="mb-4 bg-gradient-to-r from-blue-50 to-indigo-50 border border-blue-100 p-4 rounded-2xl flex flex-col md:flex-row items-center justify-between gap-4 print:hidden">
+              <div className="flex items-center gap-3">
+                <div className={`p-2 rounded-xl ${btStatus === 'connected' ? 'bg-green-100 text-green-600' : 'bg-blue-100 text-blue-600'}`}>
+                  <Bluetooth size={20} className={btStatus === 'connecting' ? 'animate-pulse animate-infinite' : ''} />
+                </div>
+                <div>
+                  <h4 className="text-sm font-bold text-gray-800">Cetak Struk Thermal via Bluetooth</h4>
+                  <p className="text-xs text-gray-500">
+                    {btStatus === 'unsupported' && "Bluetooth tidak didukung di browser ini."}
+                    {btStatus === 'disconnected' && "Printer belum tersambung."}
+                    {btStatus === 'connecting' && "Menghubungkan ke printer..."}
+                    {btStatus === 'connected' && `Tersambung ke: ${btDevice?.name || 'Thermal Printer'}`}
+                  </p>
+                </div>
+              </div>
+              
+              <div className="flex items-center gap-2 w-full md:w-auto justify-end">
+                {btStatus === 'disconnected' && (
+                  <button 
+                    onClick={connectBluetooth}
+                    className="w-full md:w-auto bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold px-4 py-2 rounded-xl transition-all shadow-sm shadow-blue-100"
+                  >
+                    Sambungkan Printer
+                  </button>
+                )}
+                {btStatus === 'connected' && (
+                  <>
+                    <button 
+                      onClick={sendPrintJob}
+                      className="w-full md:w-auto bg-green-600 hover:bg-green-700 text-white text-xs font-bold px-4 py-2 rounded-xl transition-all shadow-sm flex items-center justify-center gap-2"
+                    >
+                      <Printer size={14} />
+                      <span>Cetak Sekarang</span>
+                    </button>
+                    <button 
+                      onClick={disconnectBluetooth}
+                      className="text-xs text-red-500 hover:text-red-700 font-medium px-3 py-2"
+                    >
+                      Putus
+                    </button>
+                  </>
+                )}
+                {btStatus === 'connecting' && (
+                  <div className="flex items-center gap-2 text-xs text-gray-500">
+                    <div className="w-4 h-4 border-2 border-gray-300 border-t-blue-600 rounded-full animate-spin" />
+                    <span>Menghubungkan...</span>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+          {btError && (
+            <div className="mb-4 p-3 bg-red-50 text-red-600 border border-red-100 rounded-xl text-xs flex justify-between items-center print:hidden">
+              <span>{btError}</span>
+              <button onClick={() => setBtError(null)} className="text-red-500 font-bold px-1 hover:text-red-700">X</button>
+            </div>
+          )}
+
           <div className="min-w-fit flex justify-center print:block">
             {/* Paper container */}
             {printLayout === 'invoice' && (
               <div 
                 id="invoice-preview"
-                className="bg-white shadow-2xl shrink-0 flex flex-col relative print:shadow-none print:m-0 mx-auto"
+                className="bg-white shrink-0 flex flex-col relative print:shadow-none print:m-0 mx-auto border border-gray-200 rounded-2xl"
                 style={{ 
                   width: '210mm',
                   minHeight: '297mm',
@@ -598,7 +946,7 @@ export default function InvoiceApp() {
             {printLayout === 'receipt' && (
               <div 
                 id="receipt-preview"
-                className="bg-white shadow-2xl shrink-0 flex flex-col relative print:shadow-none print:m-0 mx-auto border"
+                className="bg-white border border-gray-200 rounded-xl shrink-0 flex flex-col relative print:shadow-none print:m-0 mx-auto"
                 style={{ 
                   width: '80mm',
                   minHeight: '100mm',
@@ -663,6 +1011,79 @@ export default function InvoiceApp() {
                   <div className="mt-8 mb-2 flex flex-col items-center">
                     <img src={companyInfo.signature} alt="Tanda Tangan" className="h-12 object-contain mix-blend-multiply grayscale" />
                     <div className="text-[10px] mt-1 text-gray-500">{companyInfo.signatureName}</div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {printLayout === 'receipt58' && (
+              <div 
+                id="receipt58-preview"
+                className="bg-white border border-gray-200 rounded-xl shrink-0 flex flex-col relative print:shadow-none print:m-0 mx-auto"
+                style={{ 
+                  width: '58mm',
+                  minHeight: '80mm',
+                  padding: '4mm',
+                  fontFamily: 'monospace'
+                }}
+              >
+                <div className="text-center pb-2 border-b border-dashed border-gray-400 mb-3 text-[10px]">
+                  {companyInfo.logo && (
+                    <img 
+                      src={companyInfo.logo} 
+                      alt="Logo" 
+                      className="max-h-8 mx-auto mb-1 object-contain grayscale" 
+                    />
+                  )}
+                  <h2 className="text-xs font-bold uppercase leading-tight">{companyInfo.name || 'RECEIPT'}</h2>
+                  <div className="text-[9px] mt-0.5 whitespace-pre-line leading-tight">{companyInfo.address}</div>
+                  <div className="text-[9px] mt-0.5">{companyInfo.phone}</div>
+                </div>
+
+                <div className="text-[9px] mb-3 leading-tight space-y-0.5">
+                  <div className="flex justify-between"><span>No:</span><span>{invoiceDetails.invoiceNumber}</span></div>
+                  <div className="flex justify-between"><span>Tgl:</span><span>{invoiceDetails.date}</span></div>
+                  <div className="flex justify-between"><span>Plg:</span><span>{customerInfo.name || 'Umum'}</span></div>
+                </div>
+
+                <div className="text-[9px] border-b border-dashed border-gray-400 pb-2 mb-2 leading-tight space-y-1">
+                  {items.map((item, i) => (
+                    <div key={item.id} className="mb-1">
+                      <div className="font-semibold break-words">{item.description || 'Item'}</div>
+                      <div className="flex justify-between">
+                        <span>{item.quantity} x {formatIDR(item.price)}</span>
+                        <span>{formatIDR(item.quantity * item.price)}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="text-[10px] font-bold flex justify-between mb-1.5 leading-tight">
+                  <span>TOTAL</span>
+                  <span>{formatIDR(total)}</span>
+                </div>
+
+                {invoiceDetails.taxPercent > 0 && (
+                  <div className="text-[9px] flex justify-between leading-tight">
+                    <span>Pajak</span>
+                    <span>{formatIDR(taxAmount)}</span>
+                  </div>
+                )}
+                {invoiceDetails.discount > 0 && (
+                  <div className="text-[9px] flex justify-between leading-tight">
+                    <span>Diskon</span>
+                    <span>-{formatIDR(invoiceDetails.discount)}</span>
+                  </div>
+                )}
+
+                <div className="text-center mt-4 text-[9px] whitespace-pre-line leading-tight">
+                  {invoiceDetails.notes || 'Terima Kasih'}
+                </div>
+                
+                {companyInfo.signature && (
+                  <div className="mt-6 mb-1 flex flex-col items-center">
+                    <img src={companyInfo.signature} alt="Tanda Tangan" className="h-8 object-contain mix-blend-multiply grayscale" />
+                    <div className="text-[8px] mt-0.5 text-gray-500">{companyInfo.signatureName}</div>
                   </div>
                 )}
               </div>
@@ -779,9 +1200,9 @@ function SettingsModal({
               <div className="flex-1 space-y-2">
                 <label className="block text-xs font-medium text-gray-600">Goreskan Tanda Tangan</label>
                 <div className="border-2 border-dashed border-gray-300 bg-white rounded-xl overflow-hidden relative" style={{ height: 120 }}>
-                  {tempInfo.signature && !sigCanvas.current ? (
+                  {tempInfo.signature ? (
                      <div className="absolute inset-0 flex flex-col items-center justify-center p-2">
-                       <img src={tempInfo.signature} className="max-h-full object-contain mb-1" />
+                       <img src={tempInfo.signature} alt="Pratinjau Tanda Tangan" className="max-h-full object-contain mb-1" />
                        <button onClick={() => setTempInfo({...tempInfo, signature: null})} className="text-xs text-red-500 underline">Ulangi Tanda Tangan</button>
                      </div>
                   ) : (
